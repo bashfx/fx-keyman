@@ -1,0 +1,9 @@
+#rainbow
+#TODO: norc doesnt work fully (as intended)
+#TODO: install check on init command, says install status?
+#TODO: fix command when install not complete auto creates master user
+#TODO: gen custom keys
+#TODO: prompt for cursor values
+#TODO: fix backup keys
+#TODO: key shortcuts @topic.x.y.z => #someid
+#TODO: --portable? use .local/data/keyman and .local/etc/global/key.rc

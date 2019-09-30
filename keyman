@@ -1,0 +1,1851 @@
+#!/usr/bin/env bash
+#===============================================================================
+#-------------------------------------------------------------------------------
+#$ name: keyman-vars
+#$ author:qodeninja
+#$ autobuild: 00003
+#$ date:
+#-------------------------------------------------------------------------------
+#=====================================code!=====================================
+
+  readonly T=0 F=1;
+
+  _DEPS_LOCAL=( printf ssh ssh-keygen ssh-agent )
+  _DEPS_MISSING=()
+
+  #OS Detect weird.
+  if [[ "$OSTYPE" == "darwin"* ]]; then
+    base_path=$(dirname ${BASH_SOURCE[0]}); #BSD doesnt support
+  else
+    base_path=$(dirname ${BASH_SOURCE}); #BSD doesnt support
+  fi
+
+#-------------------------------------------------------------------------------
+# EARLY-OPTIONS
+#-------------------------------------------------------------------------------
+
+  opt_log_color=0;
+
+  [[ "${@}" =~ --?(y|yes)    ]]; opt_yes=$?;
+  [[ "${@}" =~ --?(D|dev)    ]]; opt_dev=$?;
+  [[ "${@}" =~ --?(F|force)  ]]; opt_force=$?;
+  [[ "${@}" =~ --?(Q|quiet)  ]]; opt_quiet=$?;
+  [[ "${@}" =~ --?(N|norc)   ]]; opt_fresh=$?;
+  [[ "${@}" =~ --?(T|trace)  ]]; opt_trace=$?;
+
+#-------------------------------------------------------------------------------
+# DEBUG OPTIONS
+#-------------------------------------------------------------------------------
+
+
+  [[ "${@}" =~ --?(d|debug)[=:]([0-9]+) ]]; opt_debug=$?
+  opt_log_level="${BASH_REMATCH[2]:-4}";
+
+  [ $opt_dev -eq 0 ] && opt_log_level=7 && opt_debug=$T || :
+
+
+#-------------------------------------------------------------------------------
+# OTHER OPTIONS
+#-------------------------------------------------------------------------------
+
+  #top opts should not have presets here
+  opt_save=1;
+  opt_print=1;
+  opt_random=1; #dev
+  opt_dry=1; #dont run any changing commands?
+  opt_dash=1;
+
+#-------------------------------------------------------------------------------
+# VARS
+#-------------------------------------------------------------------------------
+
+  SSH_HOME="$HOME/.ssh"
+
+  OUTPUT=           #APP_OUTPUT
+  INPUT=            #APP_INPUT
+
+  CACHED_PATH=      #APP_PATH
+  CMD_TOPIC=        #APP_TOPIC
+
+  KEYMAN_HOME="$HOME/.key"
+  KEYMAN_BASE="$KEYMAN_HOME/data"
+  KEYMAN_REMBAK="$KEYMAN_HOME/bak";
+  KEYMAN_TEMP="$KEYMAN_HOME/temp";
+  KEYMAN_LOG="$KEYMAN_HOME/logs"
+
+  KEYMAN_RC="$HOME/.keyrc"
+  KEYMAN_MASTER=
+  KEYMAN_TOPIC="priv.localhost.self" #default
+
+  KEYMAN_INSTALLED=1;
+
+  LOG_COUNT=0;
+  LOG_FILE=
+  LOG_RESET=1;
+
+  THIS_USER=
+  THIS_CTX=
+  THIS_HOST=
+  THIS_RID=
+  THIS_KEY=
+
+  cmd=
+
+#-------------------------------------------------------------------------------
+# REGEX
+#-------------------------------------------------------------------------------
+
+  REGEX_ID="^([[:alnum:]_]+(-?[[:alnum:]_])*)$";
+  REGEX_TOPIC="^\@([[:alnum:]_]+([-\.]?[[:alnum:]_])*)$";
+
+#-------------------------------------------------------------------------------
+# BUFFERS
+#-------------------------------------------------------------------------------
+
+  _buf=()
+  _all=()
+  _usr=()
+  _ctx=()
+  _host=()
+  _rid=()
+  _key=()
+
+#-------------------------------------------------------------------------------
+# NON-POSIX
+#-------------------------------------------------------------------------------
+
+  md5cmd="$(which md5sum||which md5)"
+
+#-------------------------------------------------------------------------------
+# TERM
+#-------------------------------------------------------------------------------
+
+  red=$(tput setaf 9)
+  green=$(tput setaf 2)
+  blue=$(tput setaf 12)
+  yellow=$(tput setaf 11)
+  orange=$(tput setaf 214)
+  grey=$(tput setaf 244)
+  purple=$(tput setaf 213)
+  white=$(tput setaf 15)
+  wz=$(tput setaf 248)
+  x=$(tput sgr0)
+  eol=$(tput el)
+
+  idelta="\xE2\x96\xB3";
+  ipass="\xE2\x9C\x93"; #'\Uf42e'; # "\xE2\x9C\x93";
+  ifail="\xE2\x9C\x97";
+  ilambda="\xCE\xBB ";
+  idots='\xE2\x80\xA6'
+  ikey='\U1F511';
+  ilock='\xEF\xA1\x80'; #  f840  f83f  f83d  f83e  f023  f13e   ﳕ   
+  iskip='\xC2\xA7'; #§
+  idiam="\U25C7" #◇
+  istar="\xE2\x98\x85"; #★ printf ★ | hexdump
+  iflag="\xE2\x9A\x91 "; # ⚑ ⚐ 0xE2 0x9A 0x90 space?
+  iredo="\xEF\xA5\x8E" #漏
+
+  tab=$'\t'
+  nl=$'\n'
+  rl=$'\r';
+  sp=$'  '
+
+#-------------------------------------------------------------------------------
+# PRINT
+#-------------------------------------------------------------------------------
+
+   stderr(){ printf -- "${@}" 1>&2; }
+   nprint(){ [ $opt_quiet -eq 1 ] && printf "%s%b%s" "${!2:-}" "${1:-}" 1>&2; } ## 2 color is deref
+  nlprint(){ [ $opt_quiet -eq 1 ] && printf "%s%b%s" "${!2:-}" "${1:-}" "$nl" 1>&2; }
+
+
+  print_line(){ printf -v v "%-*s" "$2" ""; echo "${v// /$1}"; }
+
+  wide_line() {
+    local width="$(tput cols)" delim="${2:--}"
+    padding="$(print_line $delim 500)"
+    printf -v "out" '%*.*s %s %*.*s\n' 0 "$(((width-2-${#1})/2))" "$padding" "$1" 0 "$(((width-1-${#1})/2))" "$padding"
+    printf -- "$out"
+  }
+
+  log_n(){ :
+    ## 1 log_level
+    local color txt pre lvl=${1:-1};
+
+    if [ $lvl -le $opt_log_level ]; then
+      ## 2 log_color
+      [ $opt_log_color -eq $T  ] && color="${!2}" || color=''
+      ## 3 log_preamble
+
+      [ ! -z "$3" ] && pre="${!3}" || pre=''
+      ## 4 log_message
+      txt="${4:-}";
+      [ ! -z "$txt" ] && nlprint "$color${pre}$txt${x}"; # printf "${color}${pre}$txt${x}\n"
+    else
+      [ $opt_dev -eq 0 ] && nlprint "${idots}log ($lvl) surpressed${x}" "grey" #printf "${grey}${idots}log ($lvl) surpressed${x}\n"
+    fi
+
+  }
+
+  #always output pass status unless quiet
+        log(){ log_n 1 "white"  ""  "$1"; }
+  log_error(){ log_n 1 "red"    "ifail"   " $1"; }
+  log_pass(){  log_n 2 "green"  "ipass"   " $1"; }
+  log_fail(){  log_n 2 "red"    "ifail"   " $1"; }
+  log_warn(){  log_n 2 "orange" "idelta"   "$1"; }
+  log_woops(){  log_n 2 "orange" "iredo"   "$1"; }
+  log_info(){  log_n 3 "blue"   "ilambda"  "$1"; }
+  log_silly(){ log_n 4 "purple" "istar"    " $1"; }
+  log_trace(){ log_n 5 "grey"   "idots"    "$1"; }
+
+  log_etrace(){ [ $opt_trace -eq 0 ] && lvl=3 || lvl=5; log_n $lvl "red"    "idots"   "$1"; }
+  log_wtrace(){ [ $opt_trace -eq 0 ] && lvl=3 || lvl=5; log_n $lvl "orange" "idots"   "$1"; }
+  log_strace(){ [ $opt_trace -eq 0 ] && lvl=3 || lvl=5; log_n $lvl "purple" "idots"   "$1"; }
+  log_itrace(){ [ $opt_trace -eq 0 ] && lvl=3 || lvl=5; log_n $lvl "blue"   "idots"   "$1"; }
+  log_ptrace(){ [ $opt_trace -eq 0 ] && lvl=3 || lvl=5; log_n $lvl "green"  "idots"   "$1"; }
+
+  die(){ nlprint "$red$fail $1$x$nl"; exit 1; }
+
+#-------------------------------------------------------------------------------
+# LOG FILE
+#-------------------------------------------------------------------------------
+  
+  last_fx=
+
+  log_fx(){
+    local i j lvl out;
+    fxname=${FUNCNAME[1]};
+    [[ "$fxname" =~ "log_"* ]] && fxname="${FUNCNAME[2]}" || :
+    [ ! -z "$FXI" ] && i="(i=$FXI)" || i='';
+    [ ! -z "$FXJ" ] && j="(j=$FXI)" || j='';
+    out=$(wide_line "${1:-[${fxname}$i$j]}" "${2:--}");
+    #force dev level logging for trace logs
+    if [ $opt_trace -eq 0 ]; then
+     log_n 2 "grey"  ""  "$out";
+    fi
+    unset FXI; unset FXJ;
+  }
+
+  log_rfx(){
+    if [[ "${FUNCNAME[1]}" != "$last_fx" ]]; then
+      log_fx "${@}" #dont call itself pls
+      last_fx="${FUNCNAME[1]}"
+    fi
+    rem_log "${FUNCNAME[1]}";
+  }
+
+  #silent log to file
+  log_sfx(){
+    rem_log "S:${FUNCNAME[1]}";
+  }
+
+  rem_log(){
+    if [ -z "$LOG_FILE" ]; then
+      [ ! -d "$KEYMAN_LOG" ] && mkdir -p "$KEYMAN_LOG" || :
+      log_util 'count';
+      log_util 'file';
+    else
+      printf "$1\n" >> $LOG_FILE;
+    fi
+  }
+
+  log_util(){
+    local ret name rc="$KEYMAN_LOG/.counter"
+    if [ -d "$KEYMAN_LOG" ]; then
+      [ ! -f "$rc" ] && { touch "$rc"; printf "1" >> $rc; } || :
+      case "$1" in
+          inc) ((LOG_COUNT+=1)); printf "$LOG_COUNT" > $rc;;
+        count) LOG_COUNT=$(<"$rc");;
+          get) printf "%s" "$LOG_COUNT";;
+        reset) LOG_RESET=0; printf "0" > $rc;;
+         file)
+           printf -v name "%04d.keyman_%s.log" "$LOG_COUNT" "${CPID}";
+           LOG_FILE="$KEYMAN_LOG/$name";
+           [ ! -f $LOG_FILE ] && touch "$LOG_FILE" && rem_log "##($LOG_COUNT)$LINE##" || :
+        ;;
+        *) : ;;
+      esac
+    fi
+  }
+
+  log_reset(){
+    log_warn "Resetting Log..."
+    LOG_COUNT=0
+    LOG_RESET=0
+    rm "$KEYMAN_LOG/"*.* &> /dev/null; #nukes all trash
+    rm "$KEYMAN_LOG/.counter" &> /dev/null;
+  }
+
+  log_histogram(){
+    data="$( cat $KEYMAN_LOG/*.log | tr ' ' '\n' | awk 'NF && $1!~/^#/' | sort | uniq -c | sort -rn | awk '{ printf("%03d:%s\n", $1, $2) }' )"
+    log_info "histogram \n\n$data\n\n";
+  }
+
+#-------------------------------------------------------------------------------
+# UTILS
+#-------------------------------------------------------------------------------
+
+  noop(){ err="NOOP"; return 1; }
+  command_exists(){ log_sfx; type "$1" &> /dev/null;  }
+  not_empty(){ [ ! -z "$1" ] && return 0 || return 1; }
+  to_upper(){  log_sfx; echo $1 | tr '[a-z]' '[A-Z]'; }
+  to_lower(){  log_sfx; echo $1 | tr '[A-Z]' '[a-z]'; }
+  def(){ log_sfx; printf -v "$1" '%s' "$2"; } #use instead of eval
+  in_array(){ log_sfx; local e; for e in "${@:2}"; do [[ "$e" == "$1" ]] && return 0; done; return 1;}
+
+#-------------------------------------------------------------------------------
+# USER INPUT
+#-------------------------------------------------------------------------------
+
+  confirm(){
+    log_sfx;
+    local src ret cont=1 auto=${2:-0} y=$opt_yes bg="${bld}${green}" br="${bld}${red}" ret=1
+    nprint "${rl}${1}? > " "white2"
+
+    [[ "$auto" = "c" ]] && { auto=0; cont=0; } #continue with enter
+
+    [ $y -eq 0 -a $auto -eq 1 ] && nlprint "${br}auto no${x}\n" && return 1;
+    [ $y -eq 0 ] && nlprint "${bg}auto yes${x}\n" && return 0;
+
+    [[ -f ${BASH_SOURCE} ]] && src='/dev/stdin' || src='/dev/tty' #how does this work for pipe
+
+    while read -n 1 -s INPUT < $src; do
+      [ ${#INPUT} -eq 0 -a $cont -eq 0 ] && nprint "${bg}yes${x}" && return 0 || :
+      [ $? -eq 1 ] && stderr "Error occured?" && exit 1;
+      if [[ $INPUT = [YyNn10tf+\-q] ]]; then
+        [[ $INPUT = [Yyt1+] ]] && nprint "${bg}yes${x}" && ret=0 || :
+        [[ $INPUT = [Nnf0\-] ]] && nprint "${br}no${x}" && ret=1 || :
+        [[ $INPUT = [q] ]] && stderr "\n" && exit 1 || :
+        break
+      fi
+    done
+    stderr " ${nl}${x}"
+    return $ret
+  }
+
+
+  prompt(){
+    log_sfx;
+    local IFS res ret next prompt="$1" auto="$2" y=$opt_yes bg="${bld}${green}" br="${bld}${red}" #INPUT as global
+
+    [ $y -eq 0 ] && [ ! -n "$auto" ] && die "Missing default value specified for auto-yes prompt";
+    [[ "$auto" = "c" ]] && { auto=""; } #continue as clear
+    [ $y -eq 0 ] && nlprint "${bg}auto default:[${auto}]${x}" && echo "$auto" && return 0;
+
+    [ -n "$auto" ] && prompt="$prompt ($auto)" || :
+
+    [[ -f ${BASH_SOURCE} ]] && src='/dev/stdin' || src='/dev/tty' #how does this work for pipe
+    while [[ -z "$next" ]]; do
+      IFS= read -p "${rl}${x}$prompt? > ${bg}" INPUT;
+      next=1
+      stderr "$eol${x}"
+    done
+    [ -n "$auto" -a ! -n "$INPUT" ] && INPUT="$auto";
+    echo "$INPUT"
+  }
+
+  #careful cuz this doenst check for flag empty logic
+  flag_on(){
+    local f="opt_$1" r ret; r="${!f}";
+    log_strace "--${1}:$r"
+    case $r in
+      ''|*[!0-9]*) return 1;; #maybe return 2?
+      *) [ $r -eq 0 ]; return $?;; #win
+    esac
+  }
+
+#-------------------------------------------------------------------------------
+# PRINT
+#-------------------------------------------------------------------------------
+
+  print_array(){
+    log_sfx;
+    local i this arr=("${@}") len=${#arr[@]}
+    if [ $len -gt 0 ]; then
+      for i in ${!arr[@]}; do
+        this="${arr[$i]}"
+        out=
+        stderr "$i:$this\n"
+      done
+    fi
+  }
+
+  print_cols(){
+    log_sfx;
+    local i this arr=("${@}") len=${#arr[@]};
+    for i in ${!arr[@]}; do
+      this="${arr[$i]}"
+      printf "%-8s\n" "$this"
+    done | column
+  }
+
+  print_funcs(){
+    log_sfx;
+    local i this max arr=($(declare -F))
+    max=${#arr[@]};
+    if command_exists "column"; then
+      for (( i=0; i<=(max/3)-1; i+=1 )); do
+        ((idx=3*$i+2))
+        printf "%-8s\n" "${arr[$idx]}"
+      done | column
+    else
+      log_error "Command column is missing, cannot run!"
+    fi
+  }
+
+  #:^ Change this to accept force flag when we want to see output
+  print_prefixed(){
+    log_fx;
+    local IFS="=" prefix=$1 line;
+    log_itrace "Cursor:$prefix"
+    if not_empty "$prefix"; then
+      compgen -v | grep ${prefix} | while read -r line value ; do
+        opt_trace=$T
+        log_wtrace "$line => ${!line}"
+        opt_trace=$F
+      done
+    fi
+  }
+
+
+#-------------------------------------------------------------------------------
+# BUFFER
+#-------------------------------------------------------------------------------
+
+  get_buffer(){
+    log_sfx;
+    printf "${_buf[*]}";
+  }
+
+  clear_buffer(){
+    log_sfx;
+    INPUT=
+    OUTPUT=
+    _buf=()
+  }
+
+
+  load_buffer(){
+    log_rfx
+    local by="${1:-all}" data res;
+
+    # opt_fresh
+    case "$by" in
+        all) _buf=("${_all[@]}") ;;
+       user) _buf=("${_usr[@]}") ;;
+        ctx) _buf=("${_ctx[@]}") ;;
+       host) _buf=("${_host[@]}") ;;
+        rid) _buf=("${_rid[@]}") ;;
+        key) _buf=("${_key[@]}") ;;
+          *) : ;; #just get normal buf
+    esac
+
+    res=($(get_buffer))
+    size="${#res[@]}";
+
+    log_itrace "Print cache by ($by)... size($size)"
+
+    print_array "${res[@]}";
+  }
+
+#-------------------------------------------------------------------------------
+# USAGE
+#-------------------------------------------------------------------------------
+
+  usage(){
+    local count data b=$blue g=$green o=$white w=$wz u=$grey
+    data+=""
+    data="$(cat <<-EOF
+			\n${LINE}
+			\n\t${b}keyman <command> --option:opt_arg ${x}
+
+			\t${w}Topic:${x} [USER.CTX.HOST.RID.KEY]
+
+			\t${w}Commands:${x}
+
+			\t  ${o}ls  [topic]${x}         ${w}List topic info.${x}
+			\t  ${o}add [topic] <lbl>${x}   ${w}Add new topic.${x}
+			\t  ${o}rm  [topic] <lbl>${x}   ${w}Remove topic.${x}
+
+			\t  ${o}find [topic]${x}        ${w}List topic info.${x}
+			\t  ${o}find [topic-flag]${x}   ${w}Find topics by topic flags.${x}
+
+			\t  ${o}set ${x}                ${w}Cache current topics.${x}
+			\t  ${o}is${x}                  ${w}Print keyman status.${x}
+
+			\t  ${o}init${x}                ${w}Install/Repair.${x}
+			\t  ${o}reset${x}               ${w}Uninstall.${x}
+			\t  ${o}bak${x}                 ${w}Backup.${x}
+
+			\t${w}Topic Flags:${x}
+
+			\t  ${o}--user:<lbl>${x}        ${w}Set current user.${x}
+			\t  ${o}--ctx:<lbl>${x}         ${w}Set current context.${x}
+			\t  ${o}--host:<lbl>${x}        ${w}Set current host.${x}
+			\t  ${o}--rid:<lbl>${x}         ${w}Set current remote identity.${x}
+			\t  ${o}--key:<lbl>${x}         ${w}Set current key.${x}
+
+			\t${w}Options:${x}
+
+			\t  ${o}    --print${x}         ${w}Print buffer data.${x}
+			\t  ${o}    --save${x}          ${w}Save [topics] to cache.${x}
+			\t  ${o}-F  --force${x}         ${w}Force undoable actions.${x}
+			\t  ${o}-N  --norc${x}          ${w}Dont load cache file.${x}
+			\t  ${o}-D  --dev ${x}          ${w}Enable dev_mode ${x}
+			\t  ${o}-Q  --quiet${x}         ${w}Quiet all debug info.${x}
+
+			\t  ${o}--debug:<n>${x}         ${w}Set log output level${x}
+
+			${LINE}\n
+			EOF
+    )";
+    printf "$data";
+    return 0;
+  }
+
+#-------------------------------------------------------------------------------
+# DASHBOARD PRINTERS
+#-------------------------------------------------------------------------------
+
+  print_stat(){
+    local st ret=1;
+    case $1 in
+      ''|*[!0-9]*)
+        st="${grey}~${x}"
+        ret=1;
+      ;; #maybe return 2?
+      *) {
+        [ $1 -eq 0 ] && st="${green}${ipass}${x}";
+        [ $1 -eq 1 ] && st="${red}${ifail}${x}";
+        ret=0;
+      };; #wins
+    esac
+    printf "$st"
+    return $ret;
+  }
+
+  print_val(){
+    local st ret=1;
+    [ -z "$1" ] && st="${grey}~${x}" ;
+    [ ! -z "$1" ] && st="${orange} ${1} ${x}";
+    printf "$st"
+  }
+
+
+  print_lvl(){
+    local st ret=1 c="white";
+    [ $1 -le $opt_log_level ] && st="${green}${ipass}" || st="${red}${ifail}";
+    case $1 in
+      0) c="red";;
+      1) c="green";;
+      2) c="yellow";;
+      3) c="blue";;
+      4) c="purple";;
+      5) c="grey";;
+    esac
+    printf "$st${x}"
+    return $ret;
+  }
+
+#-------------------------------------------------------------------------------
+# DASHBOARD
+#-------------------------------------------------------------------------------
+
+#:# 45 turq
+#:# 25 close match lu
+
+  log_dashboard(){
+    local i this line count data
+    local o=$orange b=$blue g=$green w=$white u=$wz
+
+    pst=print_stat
+    prv=print_val
+    plv=print_lvl
+
+    opt="${VAR_ARG:-25}"
+    opt2="${VAR_ARG2:-45}"
+    opt3="${VAR_ARG3:-25}"
+
+    c1=$(tput setaf $opt);
+    c2=$(tput setaf $opt2);
+    c3=$(tput setaf $opt3);
+
+    line=$(wide_line "###" "~")
+    data+=""
+    data="$(cat <<-EOF
+			$rl${c1}$line${x}$nl
+
+			${c2}Command${x} ${cmd_str} $CMD_TOPIC $T $F
+
+			${c2}Vars${x}
+
+			${c3}Log [$($prv $KEYMAN_LOG)${c3}]
+
+			${c3}Debug[$($prv $opt_log_level)${c3}]  ERROR[$($plv 1)${c3}] PASS[$($plv 1)${c3}] WARN[$($plv 2)${c3}] INFO[$($plv 3)${c3}] SILLY[$($plv 4)${c3}]  TRACE[$($plv 5)${c3}] 
+
+			${c3}Install[$($pst $KEYMAN_INSTALLED)${c3}] ${c3}Master[$($prv $KEYMAN_MASTER)${c3}]
+
+			${c3}Base[$($prv $PARAM_BASE)${c3}]${x}
+
+			${c3}v1[$($prv $VAR_ARG)${c3}] v2[$($prv $VAR_ARG2)${c3}] v3[$($prv $VAR_ARG3)${c3}]${x}
+
+			${c2}${iflag}Flags${x} ${c3}-d[$($pst $opt_debug)${c3}] -D[$($pst $opt_dev)${c3}] -T[$($pst $opt_trace)${c3}] -Q[$($pst $opt_quiet)${c3}] -F[$($pst $opt_force)${c3}] -N[$($pst $opt_fresh)${c3}] -y[$($pst $opt_yes)${c3}]${x}
+
+			${c2}${idelta} Mods${x}  ${c3}Save[$($pst $opt_save)${c3}] Print[$($pst $opt_print)${c3}] Rand[$($pst $opt_rand)${c3}] Dry[$($pst $opt_dry)${c3}] Dash[$($pst $opt_dash)${c3}]${x}
+
+			${red}Err:[ ${x}$err${red} ]${x}
+			${green}Out:[ ${x}$out${green} ]${x}
+
+			$nl$nl$rl${c1}$line${x}
+			$rl
+			EOF
+    )";
+    printf "$data" 1>&2;
+    return 0;
+  }
+
+
+#-------------------------------------------------------------------------------
+# CHECK FOR BASIC DEPENDENCIES
+#-------------------------------------------------------------------------------
+
+  check_deps(){
+    local dep
+    for dep in "${@}"; do
+      #log_wtrace "checking dep $dep"
+      if ! command_exists "$dep"; then
+        _DEPS_MISSING+=("$dep")
+        #log_etrace "Missing dep $dep"
+      else
+        #log_itrace "Dep $dep found."
+        :
+      fi
+    done
+    #log_itrace "Deps Missing ${#_DEPS_MISSING[@]}"
+    [ ${#_DEPS_MISSING[@]} -gt 0 ] && return $F;
+    return $T;
+  }
+
+
+  #handholding
+  check_install(){
+    log_rfx
+    local ret=1;
+
+    if [ $KEYMAN_INSTALLED -eq 1 ]; then
+
+      if [ $opt_fresh -eq 0 ]; then
+        log_pass "Attempting fresh install check. Cache disabled.";
+      else
+        log_warn "Keyman setup doesnt seem complete."
+        out="Run ${blue}keyman init${x} again to complete setup.";
+      fi
+
+      if check_deps "${_DEPS_LOCAL[@]}"; then
+        [ -e $KEYMAN_HOME -a -e $SSH_HOME -a -e $KEYMAN_RC ] && KEYMAN_INSTALLED=0 && ret=0;
+        [ $opt_fresh -eq 1 ] && [ $KEYMAN_INSTALLED -eq 0 ] && COMPLETE=1 && out=;
+      else
+        err="Missing dependencies! [ ${_DEPS_MISSING[@]} ] ";
+      fi
+
+    else
+      if ! flag_on 'fresh' && not_empty "$KEYMAN_MASTER"; then
+        warn="Keyman appears fully installed.";
+        #exit 0;
+      else
+        api_master_init
+        [ $opt_fresh -eq 0 ] && log_pass "Keyman appears fully installed.";
+        [[ "$COMPLETE" = "1" ]] && out="${green}${istar}Keyman setup complete! (master=$KEYMAN_MASTER)${x}";
+        #not master then exit
+      fi
+    fi
+
+    unset _DEPS_MISSING _DEPS_LOCAL dep;
+    return $ret;
+  }
+
+
+  check_default(){
+    :
+  }
+
+#-------------------------------------------------------------------------------
+# API:REMBAK
+#-------------------------------------------------------------------------------
+
+
+  local_dir_version(){
+    log_rfx;
+    local start="$1" path="$2" #start=TRASH_HOME
+    local base name hsum hashname regex arr len next topic
+
+    base="${path%/*}" #everything after last /
+    name="${base##*/}"
+    hsum=($(echo $base | $md5cmd)) #bash array hack
+    hashname="${hsum}__${name}"
+    regex="(${hashname}_[0-9]{3})" #predetermined hash
+
+    #log_warn "Looking for  \n\tpath:($path) \n\tname:($name) \n\tbase:($base) \n\tsum:($hsum) \n\thn:($hashname)"
+
+    arr=($(find "$start" -type d ! -path . | grep -P "$regex" ))
+    print_array "${arr[@]}";
+
+    log_info "Count is ${#arr[@]}"
+    len=${#arr[@]}
+
+    topic=$(topic_from_path $path)
+    topic="${topic//@/}"
+    log_silly "topic is $topic | $base | $path"
+
+    touch "$start/topic.$topic"
+
+    printf -v next "%s__%s_%03d" "$hsum" "$name" "$len"
+    printf "%s" "$next";
+
+  }
+
+
+  make_dir(){
+    log_rfx;
+    [ -z "$1" ] && err="Cant make_dir, path undefined." && return 1 || :;
+    [ -e "$1" ] && warn="Path $1 already exists." && return 2 || :;
+    log_silly "Making path... $1"
+    mkdir -p "$1"; return $?;
+  }
+
+
+  rm_dir(){
+    log_rfx;
+    local next trash_dir="$KEYMAN_REMBAK" name=$(basename $1);
+
+    [ -z "$1"   ] && err="Cant rm_dir, path undefined." && return 1;
+    [ ! -e "$1" ] && log_warn "Path $1 doesnt exist."   && return 0;
+
+    if [ $opt_force -eq 0 ]; then
+      log_warn "Deleting file... [ --force flag ]";
+      rm -rf "$1"; return $?;
+    else
+      [ ! -d "$trash_dir" ] && make_dir "$trash_dir";
+      next=$(local_dir_version "$trash_dir" "$1")
+      log_warn "Move to local trash: $next (hard mode disabled)";
+      mv "$1" "$trash_dir/$next";
+    fi
+
+  }
+
+
+
+  bak_dir(){
+    log_rfx
+    local next trash_dir="$KEYMAN_REMBAK" name=$(basename $1);
+    [ -z "$1"   ] && err="Cant bak_dir, path undefined." && return 1;
+    #[ ! -e "$1" ] && log_warn "Path $1 doesnt exist."   && return 0;
+    next=$(local_dir_version "$trash_dir" "$1")
+    target="$trash_dir/$next";
+
+    #[ -d "$target" ]
+  }
+
+
+
+
+  find_hash_refs(){
+    log_rfx;
+    local hashref="$1" mode="${2:-d}" arr
+    regex="(${hashref}__.+)" #predetermined hash
+    arr=($(find "$start" -type $mode ! -path . -exec basename {} ';'| sort | grep -P "$regex" ))
+    printf "${arr[*]}";
+  }
+
+
+  find_baks_buf(){
+    log_rfx;
+    local start="$1" path="$2" base name hsum
+    _buf=()
+
+    ##[[ "${path:-1}" != / ]] && path="$path/"
+
+    base="${path%/*}" #everything after last /
+    name="${base##*/}"
+
+    hsum=($(echo $base | md5sum))
+    _buf=($(find_hash_refs "$hsum"))
+
+    log_itrace "found (${#_buf[@]}) bakup"; ## | $path | $base | $name | $hsum"
+
+    OUTPUT="$hsum"; #need this outside of the fx call
+    #printf "${_ref[*]}";
+  }
+
+
+  check_trash(){
+    log_rfx;
+    local start="$KEYMAN_REMBAK" #set start folder as param
+    local trash_dirs trash_files _hashes=() _ref=() _missing=()
+    local base hsum ilen jlen next this topic prefix re vers
+    trash_dirs=($(find_dirs $start d))
+    trash_files=($(find_dirs $start f))
+
+    re='([a-f0-9]+)__(.*)_([0-9]{3})$'
+    ilen="${#trash_files[@]}";
+
+    for i in "${!trash_files[@]}"; do
+
+      this="${trash_files[$i]}";
+      topic="${this//topic./}"
+
+      #check for debug prefix
+      [[ "$topic" =~ ^test* ]] && prefix="none" || prefix="$KEYMAN_BASE";
+
+      path=$(path_from_topic "@$topic" "$prefix");ret=$?]
+      #log_itrace "Path is $path ($this)"
+
+      find_baks_buf $start $path; ret=$?;
+      _ref=($(get_buffer));
+      hsum="$OUTPUT"
+
+      log_trace "i$i:$topic ($path) ($hsum)";
+
+      ## _ref=($(find_hash_refs "$hsum"))
+      log_itrace "hash is $hsum"
+      print_array "${_ref[@]}";
+
+
+      jlen="${#_ref[@]}"
+
+      if [ $jlen -gt 0 ]; then
+        for j in "${!_ref[@]}"; do
+          that="${_ref[$j]}"
+          #that="${that//${hsum}__/}"
+
+          if [[ $that =~ $re ]]; then
+            hmd5="${BASH_REMATCH[1]}"
+            fname="${BASH_REMATCH[2]}"
+            vers="${BASH_REMATCH[3]}"
+
+          fi
+
+          log_info "[$i][$j] > f:$fname v:$vers h:$hmd5"
+        done
+        _hashes+=($hsum)
+      else
+        :
+        #topic has no backups
+        log_error "Topic $topic has no backsups in trash ($hsum)"
+        #delete topic!
+        _invalid+=($hsum)
+        _bad_topic+=($topic)
+      fi
+
+    # print_array "${_ref[@]}"
+
+    done
+
+    #for i in "${!_hashes[@]}"; do
+    # this="${_hashes[$i]}";
+    # log_wtrace "hash:$this"
+    #done
+
+    for i in "${!trash_dirs[@]}"; do
+      this="${trash_dirs[$i]}";
+      log_strace "dir:$this"
+      if [[ $this =~ $re ]]; then
+
+        hmd5="${BASH_REMATCH[1]}"
+        fname="${BASH_REMATCH[2]}"
+        vers="${BASH_REMATCH[3]}"
+
+         if in_array "$hmd5" "${_hashes[@]}"; then
+            log_ptrace "Found $fname:$hmd5"
+         else
+            log_etrace "Hash $fname:$hmd5 is missing";
+            _missing+=($this)
+         fi
+
+      fi
+    done
+
+    for i in "${!_invalid[@]}"; do
+      this="${_bad_topic[$i]}";
+      log_warn "Delete orphaned topic ($this)?"
+    done
+
+    for i in "${!_missing[@]}"; do
+      this="${_missing[$i]}";
+      log_warn "Delete unrestorable backup ($this)?"
+    done
+
+    #print_array "${_missing[@]}";
+    #log_itrace "Start folder is $start"
+  }
+
+  
+
+#-------------------------------------------------------------------------------
+# API:RESET
+#-------------------------------------------------------------------------------
+
+
+  hard_reset(){
+    log_rfx;
+
+    if flag_on force; then
+      log_warn "Resetting all keyman data, Dev Flag is enabled";
+      #rm -rf "$SSH_HOME" &> /dev/null; #dont do this. scary!
+      log_util 'reset';
+      rm -rf "$KEYMAN_LOG" &> /dev/null;
+      rm -rf "$KEYMAN_REMBAK" &> /dev/null;
+      rm -rf "$KEYMAN_HOME" &> /dev/null;
+      rm "$KEYMAN_RC" &> /dev/null;
+    else
+      out="Hard reset not run, use --force flag to remove all. \n";
+    fi
+    return 0
+  }
+
+  api_keyman_reset(){
+    log_rfx;
+    hard_reset
+  }
+
+#-------------------------------------------------------------------------------
+# API:INIT
+#-------------------------------------------------------------------------------
+
+  ssh_init(){
+    log_rfx;
+
+    #log_error "This is desctructive to local .ssh careful!";
+
+    if [ ! -e "$SSH_HOME" ]; then
+      make_dir "$SSH_HOME";
+      chmod 0700 "$SSH_HOME" #secure dir
+      touch "$SSH_HOME/config";
+      chmod 0700 "$SSH_HOME/config";
+      #check for perms
+      #check for config
+    fi
+  }
+
+  home_init(){
+    log_rfx;
+    #KEYMAN_MASTER="${THIS_USER:-$USER}";
+    #mkdir -p "$KEYMAN_HOME/ctx/$THIS_USER";
+    make_dir "$KEYMAN_BASE";
+    make_dir "$KEYMAN_LOG";
+    make_dir "$KEYMAN_REMBAK";
+    make_dir "$KEYMAN_TEMP";
+    #make first user
+    #api_keyman_add 'user' "$KEYMAN_MASTER";
+  }
+
+
+  api_keyman_init(){
+    log_rfx;
+    check_install; ret=$?
+    #print_info
+    ssh_init
+    home_init
+    opt_save=$T;
+    #api_master_init
+  }
+
+
+  install_repair(){
+    log_fx
+    if confirm "Do you want to install/repair now?"; then
+      api_keyman_init
+      make_rc #save flag here wont help rc needs to be set before check_install
+      return 0
+    else
+      return 1
+    fi
+  }
+
+
+  api_master_init(){
+    log_fx
+    local val
+
+    if [ -z "$KEYMAN_MASTER" ]; then
+
+      if confirm "Do you want to setup the MASTER user now (y/n)"; then
+
+        if ! confirm "Use system user ($USER) (y/n)"; then
+          val=$(prompt "${blue}What MASTER username to use (default is $USER)" "$USER")
+        else
+          val="$USER"
+        fi
+
+        log_itrace "Master user is $(to_upper $val)"
+        KEYMAN_MASTER=$val;
+        api_default_key $val;
+        opt_save=$T; #save master pls
+        OUTPUT="$val";
+
+      else
+        log_warn "Master user must be configured before using KEYMAN."
+        exit 1
+      fi
+    else
+      log_info "Keyman MASTER is $(to_upper $KEYMAN_MASTER)"
+    fi
+
+  }
+
+  resolve_base(){
+    log_sfx; local base="$1"
+    [ ! -z "$PARAM_BASE" ] && base="$PARAM_BASE" || :
+    [[ "$base" == "none" ]] && base="/" || base="${base:-$KEYMAN_BASE}/";
+    printf "%s" "$base"
+    return 0;
+  }
+
+  ## values for 3,4,5 were changed in v5
+  by_idx(){
+    log_rfx;
+    case "$1" in
+    ##  0) printf "base";;
+      1) printf "user";;
+      2) printf "ctx";;
+      3) printf "host";;
+      4) printf "rid";;
+      5) printf "key";;
+  user*) printf 1;;
+   ctx*) printf 2;;
+  host*) printf 3;;
+   rid*) printf 4;;
+   key*) printf 5;;
+      *) printf "invalid" && return 1;;
+    esac
+    return 0;
+  }
+
+#-------------------------------------------------------------------------------
+# API:TOPICS
+#-------------------------------------------------------------------------------
+
+  path_from_topic(){
+    log_rfx;
+    local this="$1" base="$(resolve_base $2)"
+
+    log_wtrace "base set to [$base] "; ##|| vals ($1) ($2) ($PARAM_BASE)"
+
+    if is_topic "$1"; then
+      this="${this//@/}"
+      this="${this//.//}"
+      this="$base$this" #trailing slash is not better, inbetween slash moved
+      printf "$this"
+      log_ptrace "path is $this"
+      return 0
+    fi
+    return 1
+  }
+
+#-------------------------------------------------------------------------------
+# TOPIC UTILS
+#-------------------------------------------------------------------------------
+
+
+  is_topic(){ [[ "$1" =~ $REGEX_TOPIC ]] && return 0 || return 1; }
+
+  #:! UNUSED
+  cursor_copy(){
+    local from_prefix=$1 to_prefix=$2
+    local i this topic max parts=(USER CTX HOST KEY RID)
+    for i in ${!parts[@]}; do
+      this="${from_prefix}_${parts[$i]}"
+      ref="${!this}"
+      that="${to_prefix}_${parts[$i]}"
+      log_wtrace "Set ($this => $that) $ref";
+      def "$that" "$ref"
+     done
+  }
+
+  #:! UNUSED
+  topic_cursor(){
+    log_rfx;
+    local ref ret=0 pre=${APP_PREFIX:-THIS} mode=${2:-0}
+    case "$1" in
+      0|base)   ref="KEYMAN_BASE";;
+      1|user)   by=USER;;
+      2|ctx)    by=CTX;;
+      3|host)   by=HOST;;
+      4|rid)    by=RID;;
+      5|key)    by=KEY;;
+      *)        ret=1; ref="";;
+    esac
+    [ -z "$ref" ] && ref="${pre}_${by}"
+    #log_info "$ref is ${!ref}"
+    [ ! -z "$ref" ] && [ $mode -eq 0 ] && printf "${!ref}" || printf "$ref";
+    return $ret;
+  }
+
+  topic_validator(){
+    log_rfx;
+    local this path i index=-1 skip=1 array=("${@}")
+
+    base_dir="$KEYMAN_HOME/data";
+
+    for i in "${!array[@]}"; do
+      this="${array[$i]}";
+      log_info "validator: $i $this"
+      if [ $skip -eq $T ]; then
+        ret=$F;
+      else
+        if [ ! -z $this ]; then
+          path+="/$this"
+          if [ ! -d "$base_dir$path" ]; then
+            skip=$T;
+            ret=$F;
+            err='';
+          else
+            index="$i"
+            CACHED_PATH="$base_dir$path" #no dir delim
+          fi
+        else
+          skip=$T
+        fi
+      fi
+    done
+    ((index+=1))
+    [ $index -eq 0 ] && CACHED_PATH="$base_dir";
+    OUTPUT=$index;
+    return $ret;
+  }
+
+  topic_from_path(){
+    log_rfx;
+    local this="$1" base="$KEYMAN_BASE";
+    this="${this//$base/}"
+    this="${this//\//.}"
+    this="${this#?}" #remove first char, careful if not dot
+    printf "@$this"
+  }
+
+
+#-------------------------------------------------------------------------------
+# CURSOR UTILS
+#-------------------------------------------------------------------------------
+
+  load_cursor_from_topic(){
+    log_rfx;
+    local prefix=$1 topic=$2 __ by i j path ret
+
+    [ $# -lt 2 ] && log_error "${FUNCNAME[0]} Requires prefix and topic" && return 1;
+
+    if is_topic "$topic"; then  # [[ "$topic" =~ $REGEX_TOPIC ]]
+      __=(${topic//./ })
+      for i in ${!__[@]}; do
+        this="${__[$i]}"
+        this="${this//@/}"
+        ((j=i+1))
+        last_fx="by_idx"
+        by="$($last_fx $j)";ret=$?
+        if [ $ret -eq 0 ]; then
+          ref="${prefix}_$(to_upper $by)"
+          def "$ref" "$this";
+          log_itrace "TOPIC($prefix) > $ref=$this"
+          path="$path/$this";
+        else
+          ret=1
+        fi
+      done
+
+      if [ $ret -eq 0 ]; then
+        #[[ "${path:-1}" != / ]] && path="$path/";
+        CACHED_PATH="$KEYMAN_BASE/$path"
+      fi
+    else
+      log_error "Topic is invalid ($topic)";
+    fi
+  }
+
+
+  cursor_topic_validator(){
+    log_rfx
+    local prefix=$1 index=$2
+    local i this val parts=(USER CTX HOST RID KEY) arr=()
+
+    for i in ${!parts[@]}; do
+      (( index == i )) && break;
+      this="${prefix}_${parts[$i]}"
+      arr+=(${!this})
+      log_info "$i $this ${!this}"
+    done
+    #print_array "${arr[@]}";
+    topic_validator "${arr[@]}";
+    val=$OUTPUT; # output is maximum allowed value
+
+
+    log_itrace "($prefix) Validator idx:($index). out:$OUTPUT $CACHED_PATH"
+
+    [ ! -z "$index" ] && [ $index -le $val ] && return $T || return $F;
+    #printf $val
+    return $T;
+  }
+
+#-------------------------------------------------------------------------------
+
+
+#-------------------------------------------------------------------------------
+# API : EDIT (ADD/REMOVE)
+#-------------------------------------------------------------------------------
+
+  api_keyman_list(){
+    log_rfx;
+    local by="$1" filter len i ret
+    cache_topics
+
+    case "$by" in
+      all)   _buf=("${_all[@]}");;
+      user*) _buf=("${_usr[@]}");;
+      ctx*)  _buf=("${_ctx[@]}");;
+      host*) _buf=("${_host[@]}");;
+      rid*)  _buf=("${_rid[@]}");;
+      key*)  _buf=("${_key[@]}");;
+    esac
+
+    len=${#_buf[@]};
+
+    for i in ${_buf[@]}; do
+      stderr "($by) list: $i\n"
+    done
+
+    #filter_topic "${_buf[@]}"
+
+    #array_as_file
+
+  }
+
+
+  api_keyman_filter(){
+    log_rfx;
+    local by="$1" res len i ret
+    res="$(filter $by)"
+    print_array "${res[@]}"
+  }
+
+  #:! UNUSED
+  #save for later but a version not using awk
+  filter_topic(){
+    log_rfx
+    local by res len this __
+    local rem_user
+
+    find_all_topics
+    
+    _all=($(get_buffer))
+    len=${#_all[@]}
+
+    #  sort <(for f in "${files[@]}" ; do echo "$f" ; done)
+
+    for i in ${!_all[@]}; do
+
+      this=$(topic_from_path "${_all[$i]}")
+
+      __=(${this//./ });
+      len=${#__[@]};
+
+      rem_user=${__[0]}
+      rem_ctx=${__[1]}
+      rem_host=${__[2]}
+      rem_rid=${__[3]}
+      rem_key=${__[4]}
+
+      case "$len" in
+        1) 
+          by='user'; 
+          [ -n "$PARAM_USER" ]
+
+          _usr+=("$this") 
+        ;;
+        2) 
+          by='ctx';  
+          _ctx+=("$this") 
+        ;;
+        3) 
+          by='idy';  
+          _idy+=("$this") 
+        ;;
+        4) 
+          by='key';
+          _key+=("$this") 
+        ;;
+        *) : ;;
+      esac
+
+
+
+    done
+
+
+  }
+
+
+  api_keyman_edit(){
+    log_rfx
+    local cmd mode=$1 by=$2 data=$3 path ret;
+
+    #check mode
+    case "$mode" in
+      add) cmd="make_dir" ;;
+      rem) cmd="rm_dir"   ;;
+      bak) cmd="bak_dir"  ;;
+      ls)  cmd="load_buffer";;
+      *) err="Invalid command ($mode)"; return 1;;
+    esac
+
+    case "$by" in
+      user|ctx|idy|key|rid) : ;;
+      auto) : ;;
+      $CMD_TOPIC) by='topic' ;;
+      *) err="Invalid modifier ($by)"; return 1;;
+    esac
+
+
+    if [ ! -z "$CMD_TOPIC" ]; then
+
+      data="$CMD_TOPIC"
+      path=$(path_from_topic $data);
+      #path="$OUTPUT"
+      log_pass "Path to edit:$path ($data)"
+
+    else
+
+      bytype=$(by_idx $by)
+      ((prevby=bytype-1))
+      #((prevby=bytype-1))
+      cursor_topic_validator "THIS" $prevby; ret=$?
+
+      #for adding we need previous slot only so minus one...
+      if ((prevby == OUTPUT)); then
+        path="$CACHED_PATH/$data/"
+        ret=0;
+      fi
+
+    fi
+
+    log_itrace "Attempt $cmd ($by); $by:($data) p($path) bt($bytype)"
+
+    $cmd "$path"; ret=$?;
+
+    #log_info "$cmd returned $ret"
+
+    [ $ret -eq 0 ] && { OUTPUT="$data"; log_ptrace "Edit went good"; } || log_etrace "edit had prob $ret";
+
+    return $ret;
+
+
+  }
+
+
+  api_keyman_add(){
+    log_rfx;
+    local ret=1;
+
+    api_keyman_edit "add" "${@}"; ret=$?
+
+    if [ $ret -eq 0 ]; then
+
+      opt_yes=$T;
+
+      if [ "$1" = "user" ]; then
+
+        api_default_key "$OUTPUT";
+        log_itrace "Should have made key for $OUTPUT";
+        out="New ($1) Added ($2)";
+
+      else
+        log_wtrace "Wanted to make something else, prolly just a dir"
+      fi
+
+    else
+
+      [ $ret -eq 2 ] && { ret=0; warn="Nope. ($(to_upper $2)) already exists."; } || :
+      [ $ret -eq 1 ] && { err="Could not ($1) ($2)"; } || :
+
+    fi
+
+    return $ret;
+  }
+
+
+  api_keyman_rem(){
+    log_rfx;local ret;
+    api_keyman_edit "rem" "${@}"; return $?;
+  }
+
+  api_keyman_is(){
+    log_dashboard
+    print_prefixed "THIS"
+  }
+
+#-------------------------------------------------------------------------------
+# API:FIND
+#-------------------------------------------------------------------------------
+
+
+  find_dirs(){
+    log_rfx;
+    local target=$1 reftype="${2:-d}" data;
+    if [ -d "$target" ];then
+      data=($(find $target -mindepth 1 -maxdepth 1 -type $reftype -exec basename {} ';'| sort))
+    fi
+    printf "${data[*]}";
+  }
+
+
+  find_all_topics(){
+    log_rfx;
+    _buf=($(find "$KEYMAN_BASE" -mindepth 1 -maxdepth 5 -type d  | sort )) ## | awk '$0 !~ last "/" {print last} {last=$0} END {print last}'
+    #[ "${#_buf[@]}" -gt 0 ] && print_array "${_buf[@]}";
+  }
+
+
+  cache_topics(){
+    log_rfx
+    local i by res len this __
+
+    find_all_topics
+    _all=($(get_buffer))
+    len=${#_all[@]}
+
+    for i in ${!_all[@]}; do
+
+      this=$(topic_from_path "${_all[$i]}")
+
+      __=(${this//./ })
+      len=${#__[@]};
+
+      case "$len" in
+        1) by='user'; _usr+=("$this") ;;
+        2) by='ctx';  _ctx+=("$this") ;;
+        3) by='host'; _host+=("$this") ;;
+        4) by='rid';  _rid+=("$this") ;;
+        5) by='key';  _key+=("$this") ;;
+      esac
+
+    done
+
+    ##  _all=("${_buf[@]}");
+    #debug_buffer;
+
+  }
+
+
+
+  debug_buffer(){
+    load_buffer "all"
+    load_buffer "user"
+    load_buffer "ctx"
+    load_buffer "host"
+    load_buffer "rid"
+    load_buffer "key"
+    _buf=();
+  }
+
+
+
+  filter(){
+    log_rfx
+    local by=$1 res __ base="${KEYMAN_BASE}/"
+    find_all_topics
+    _all=($(get_buffer))
+    _all=($(uniq <(for i in "${_all[@]}" ; do echo "${i//$base/}" ; done)))
+    _filter=($(awk_filter $by))
+    printf "${_filter[@]}"
+  }
+
+
+  awk_filter(){
+    log_sfx
+    local i by=$1;
+    [ ! -z "$by" ] && by=$(by_idx $by) || :
+    log_info "filter by $1 $by"
+    #changed TOPIC def, need to update awk vars
+    awk -F "/" -v topic="$by" -v usr="$PARAM_USER" -v ctx="$PARAM_CTX" -v idy="$PARAM_HOST" -v key="$PARAM_RID" -v kty="$PARAM_KEY" '
+      function l(q){return (length(q)!=0)}; 
+      function v(m){print m};
+      BEGIN {m=true;u=(l(usr));c=(l(ctx));i=(l(idy));k=(l(key));t=(l(kty)); a=(!u&&!c&&!i&&!k&&!t)}
+      (u){m=(usr==$1)}(c){m=(ctx==$2)}(i){m=(idy==$3)}(k){m=(key==$4)}(t){m=(kty==$5)}
+      { if(m==1){if(length(topic)==0){ v($0) }else if( length(topic)!=0 && NF==topic ){ v($0) }
+        }else{ if(a){ v($0) }}}
+    ' <(for i in "${_all[@]}" ; do echo "$i" ; done);
+  }
+
+#-------------------------------------------------------------------------------
+# RCFILE
+#-------------------------------------------------------------------------------
+
+
+  make_rc(){
+    log_rfx;
+    log_info "Saving .keyrc file..."
+
+    local data="";
+    data="$(cat <<-EOF
+			#${LINE}
+			### keyman generated config file $(date)
+			#export KEYMAN_HOME="$KEYMAN_HOME"
+			export KEYMAN_INSTALLED=$KEYMAN_INSTALLED
+			export KEYMAN_MASTER="$KEYMAN_MASTER"
+			export KEYMAN_LOG_LEVEL="$opt_log_level"
+			export LAST_USER="$THIS_USER"
+			export LAST_CTX="$THIS_CTX"
+			export LAST_HOST="$THIS_HOST"
+			export LAST_RID="$THIS_RID"
+			export LAST_KEY="$THIS_KEY"
+
+			#${LINE}
+			EOF
+    )";
+    #echo "$data"
+    echo -e "$data" > "$KEYMAN_RC"
+    [ -f "${KEYMAN_RC}" ] && return 0 || return 1;
+  }
+
+#-------------------------------------------------------------------------------
+# VARS
+#-------------------------------------------------------------------------------
+
+  load_vars(){
+    log_rfx;
+    [ -f $KEYMAN_RC ] && source $KEYMAN_RC;
+
+    THIS_USER=${THIS_USER:-$LAST_USER}
+    THIS_CTX=${THIS_CTX:-$LAST_CTX}
+    THIS_HOST=${THIS_HOST:-$LAST_HOST}
+    THIS_RID=${THIS_RID:-$LAST_RID}
+    THIS_KEY=${THIS_KEY:-$LAST_KEY}
+
+    if flag_on trace; then
+      print_prefixed "KEYMAN"
+      print_prefixed "THIS"
+      #print_info
+    fi
+    
+    [ $opt_debug -eq 1 ] && opt_log_level=${KEYMAN_LOG_LEVEL:-$opt_log_level};
+
+  }
+
+
+#-------------------------------------------------------------------------------
+# SSH INPUT
+#-------------------------------------------------------------------------------
+  save_temped_key(){
+    #name_ppid
+    local key=$1 path=$2 priv_key pub_key target
+    #__=(${keyname// })
+    #arr=(${this//\// })
+    keyname="${key%_*}"
+    priv_key="$KEYMAN_TEMP/$key/${key}.priv"
+    pub_key="$KEYMAN_TEMP/$key/${key}.pub"
+
+    #val="${this#*=}"
+    log_info "Key orig name is $key"
+    log_info "Save temp key to path $path"
+
+    target="$path/$keyname"
+    make_dir "$target";
+
+    cp $priv_key "$target/priv.key"
+    cp $pub_key  "$target/pub.key"
+    rm -rf "$KEYMAN_TEMP/$key"
+
+    OUTPUT="$keyname"
+  }
+
+
+  tempify_ssh_keys(){
+    log_rfx
+    local name=$1 base ret=1
+    if not_empty $name; then
+       base="$KEYMAN_TEMP/$name"
+       if [ -f "$base" ]; then
+         #take existing keyname and turn into a directory
+         mv "$base" "${base}.priv" && mkdir -p "${base}"
+         mv "$base.priv" "${base}/"
+         mv "${base}.pub" "${base}/"
+         [ -f  "${base}.pub" -a -f "$base.priv" ] && ret=0 || :
+       fi
+    fi
+    return $ret;
+  }
+
+  api_default_key(){
+    log_rfx
+    local path name base topic user=$1;
+    topic="@${user}.${KEYMAN_TOPIC}"
+
+    path=$(path_from_topic $topic)
+    make_dir "$path"
+    load_cursor_from_topic "THIS" $topic;
+    #print_prefixed "THIS"
+    api_keygen_ssh;
+    log_ptrace "New default key created for USER:$user at (temp/$OUTPUT)"
+    log_ptrace "Save key to path $path"
+
+    tempify_ssh_keys "$OUTPUT";
+    save_temped_key "$OUTPUT" "$path";
+
+    #reloading topic here lets key be saved. THIS_KEY didnt work initially
+    topic="${topic}.${OUTPUT}"
+    load_cursor_from_topic "THIS" $topic;
+    
+    return $?;
+  }
+
+
+
+  api_keygen_ssh(){
+    log_rfx
+    local vals=( NAME COMMENT PASS )
+
+    [ ! -d $KEYMAN_TEMP ] && make_dir "$KEYMAN_TEMP" || :
+
+    NAME=$(prompt "Enter SSH Key Name" "id_rsa") #id_rsa_(USER)
+    COMMENT=$(prompt "Enter SSH Comment or Email" "c")
+    PASS=$(prompt "Enter Key pass or blank" "c")
+    [ ! -z "$COMMENT" ] && COMMENT="\"$COMMENT\"" && opt="$opt -C $COMMENT"
+    [ ! -z "$PASS" ]  && opt="$opt -P $PASS" || : #opt="$opt"
+
+    printf -v key_name "%s_%04d" "$NAME" "$CPID"
+    printf -v key_path "%s/%s" "$KEYMAN_TEMP" "$key_name"
+
+    log_warn "$key_path"
+    log_warn "$opt"
+
+    res=$(ssh-keygen -t rsa -b 4096 -f $key_path $opt -N '')
+
+    OUTPUT="$key_name"
+  }
+
+
+
+#-------------------------------------------------------------------------------
+# MAIN
+#-------------------------------------------------------------------------------
+
+
+  dispatch(){
+    log_fx
+    local call next unk=() flag opt opt_arg arg= is_noop=$F req_inst=$T ret;
+    #load_vars
+
+    for i; do
+      arg=
+      opt=
+      next=
+      flag=
+      opt_arg=$F
+
+      #support --flag:value
+      if [[ "$i" =~ (--?)([[:alnum:]]+)[=:]([^=:]+) ]]; then #took out matching - [^\-=:]
+
+        flag="${BASH_REMATCH[2]}"
+        i="${BASH_REMATCH[1]}$flag";
+
+        #driver flags for devmode -X:val --arg:val ignored here
+        if [[ $flag != "x" ]] && [[ $flag != "arg" ]]; then
+          next="${BASH_REMATCH[3]}";
+          opt_arg=$T
+        fi
+
+      else
+        next="$2"
+      fi
+
+      log_trace "arg:$i, next:$next";
+
+      case "$i" in
+        noop)       is_noop=$T;;
+        histo)      req_inst=$F; cmd="log_histogram";;
+        init)       req_inst=$F; cmd="api_keyman_init";;
+        reset)      req_inst=$F; cmd="api_keyman_reset";;
+        master)     cmd="api_master_init";;
+        is)         req_inst=$F cmd="api_keyman_is";;
+        set)        is_noop=$T; cmd="api_keyman_set"; opt="CMD_ARG";;
+        ls)         cmd="api_keyman_list";     arg="CMD_ARG";;
+
+        add)        cmd="api_keyman_add";      arg="CMD_ARG";;
+        rm)         cmd="api_keyman_edit rem"; arg="CMD_ARG";;
+
+        find)       cmd="api_keyman_filter";   opt="CMD_ARG";; #fix this
+
+        all|users|keys|hosts|ctxs|rids) 
+                    [ -z "$cmd" ] && { cmd="api_keyman_list"; next="$i"; arg="CMD_ARG"; } || :;;
+          
+        trash)      cmd="check_trash";;
+        help)       req_inst=$F; cmd="usage";;
+        driver)     req_inst=$F; cmd="driver";;
+
+        --var|--v1) opt="VAR_ARG";;
+        --v2)       opt="VAR_ARG2";;
+        --v3)       opt="VAR_ARG3";;
+
+        --key)      arg="PARAM_KEY"  ;;
+        --rid)      arg="PARAM_RID"  ;;
+        --ctx)      arg="PARAM_CTX"  ;;
+        --user|-u)  arg="PARAM_USER" ;;
+        --host|-h)  arg="PARAM_HOST" ;;
+        --base)     arg="PARAM_BASE" ;;
+
+        -y|--yes)   opt_yes=$T;;
+        --save)     opt_save=$T;;
+        --print)    opt_print=$T;;
+        --rand*)    opt_random=$T;; #test random lookups
+        --fresh|-N) opt_fresh=$T;; #dont use cached/rc values
+        --dry)      opt_dry=$T;;
+        --dash)     opt_dash=$T;;
+        --debug*|-d) : ;;
+        --trace*|-T) : ;;
+        --force*|-F) : ;;
+        --quiet*|-Q) : ;;
+        --dev|-D)    : ;;
+        --arg|-X)    : ;; #ignore driver flags
+        ^-*)         err="Invalid flag [$i]."; continue;;
+        test)
+          #shouldnt require install
+          req_inst=$F;
+          if [ ! -z "$LOAD_PLUGIN_TEST" ] && [[ $LOAD_PLUGIN_TEST == 0 ]]; then
+            cmd="unit_test"; opt="CMD_ARG";
+          else
+            is_noop=$T;
+            err="Keyman test resource must be included first";
+          fi
+        ;;
+        *)
+          [[ "$i" =~ $REGEX_TOPIC ]] && CMD_TOPIC=$i && log_trace "[$i] looks like topic" || log_trace "$i not a topic";
+          #add st to array if it hasnt been seen already
+          if in_array "$i" "${unk[@]}"; then
+            log_trace "Removing $i from unk"
+            unk=( "${unk[@]/$i}" );
+          else
+            log_trace "Add $i to unk"
+            unk+=($i);
+          fi
+        ;;
+      esac
+
+      [ ! -z "$opt" ] && arg="$opt"; #optional argument
+
+      #log_itrace "(cmd?) CMD:$cmd ARG:$arg OPT:$opt NEXT:$next VAR:$VAR_ARG"
+
+      #the great arg shuffle
+      if not_empty "$arg"; then
+        if [ ! -z "$next" ] && [[ ! "$next" =~ ^\-\-* ]]; then
+          def "$arg" "$next";
+          log_trace "Add $next to unk (arg:$arg)"
+          [ $opt_arg -eq $F ] && unk+=($next);
+        else
+          [ -z "$opt" ] && err="Invalid option [$i] requires an argument"
+        fi
+      fi
+      shift;
+    done
+
+
+    #noop all commands that arent done yet
+    [ $is_noop -eq $T ] && last_cmd="$cmd" && cmd="noop";
+
+    run_cmd+="$cmd ";
+    if [ -z "$cmd" ]; then
+      err="Missing command [${unk[*]}]"
+      return 1
+    else
+      rem_log "cmd[${cmd// /_}]"
+    fi
+
+    #hmm if yet another argument
+    if [ -n "$CMD_ARG" -o -n "$next" ]; then
+      #log_silly "new cmd arg: $CMD_ARG=$next"
+      run_cmd+="$CMD_ARG ${unk[@]}" || CMD_ARG=;
+    fi
+
+
+    #allow some commands to run without install
+    if [ $req_inst -eq $T ]; then
+
+      if [ $KEYMAN_INSTALLED -eq 1 ]; then
+        log_warn "Keyman installation incomplete.";
+        install_repair; ret=$?
+        [ $ret -eq 1 ] && exit 1
+      fi
+
+      if [[ ! "$run_cmd" =~ "api_keyman_reset" ]]; then
+        check_install; ret=$?
+      fi
+
+    else
+      #on reset dont print anything
+      [ "$cmd" = "api_keyman_reset" ] && out= || :
+      log_itrace "Install required for ($cmd)";
+    fi
+
+    [ -n "$err" ] && return 1;
+    run_command "$run_cmd";ret=$?;
+
+    return $ret;
+  }
+
+        # ~~~~ #
+
+  run_command(){
+    log_fx;
+    [ $opt_dash -eq 0 ] && log_dashboard || :
+    if [ $opt_dry -eq 1 ]; then
+      log_itrace "[RUN COMMAND] >> $1";
+      $1; return $?;
+    else
+      log_itrace "[DRYRUN COMMAND] >> $1 (${args[*]})";
+      return 0;
+    fi
+  }
+
+
+#-------------------------------------------------------------------------------
+
+
+  post_dispatch(){
+    log_fx;
+    [[ "$COMPLETE" = "1" ]] && check_install; #must happen before make_rc to get master
+    flag_on 'print' && debug_dump "${_buf[@]}";
+    flag_on 'save'  && make_rc
+    #move to exit trap
+    if [ $LOG_RESET -eq 1 ]; then
+      log_util 'inc'
+      log_trace "Log ($LOG_COUNT) saved to $LOG_FILE"
+    else
+      log_reset
+    fi
+    log_fx "DONE" "="
+  }
+
+
+#-------------------------------------------------------------------------------
+
+  main(){
+    log_fx "KEYMAN" "="
+    local ret;
+    [ $opt_fresh -eq 1 ] && load_vars;
+    dispatch "${@}";ret=$?
+    post_dispatch;
+
+    [ -n "$warn" ] && log_woops  "[$(to_upper $1)] $warn";
+    [ -n "$err"  ] && log_error "${red}$err" && ret=1 || stderr "$out\n"; # && make_rc;
+     
+    unset out err edit _buf; #this has to be after err/out print
+    return $ret
+  }
+
+#-------------------------------------------------------------------------------
+# DRIVER
+#-------------------------------------------------------------------------------
+
+  if [[ "$0" != "-bash" ]]; then
+    main "${@}";
+  fi
+
+#-------------------------------------------------------------------------------
+#=====================================!code=====================================
